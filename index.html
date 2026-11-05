@@ -1,0 +1,182 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>TensegrityOrientationFetcherV10</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;margin:20px;color:#222}
+    header{margin-bottom:10px}
+    textarea{width:100%;height:120px;font-family:monospace}
+    .row{display:flex;gap:10px;align-items:center;margin:8px 0}
+    .preview{white-space:pre-wrap;background:#f6f6f8;padding:10px;border:1px solid #ddd}
+    button{padding:6px 10px}
+    .meta{font-size:90%;color:#555}
+  </style>
+</head>
+<body>
+  <header>
+    <h2>TensegrityOrientationFetcherV10</h2>
+    <div class="meta">Upload CSV, JSON, or a ZIP containing them. Prototype normalizes timestamps and standardizes pose columns (tx,ty,tz,qw,qx,qy,qz or roll/pitch/yaw) and produces standardized CSV/JSON with provenance metadata.</div>
+  </header>
+
+  <input id="file" type="file" />
+  <div class="row"><button id="process">Process</button><button id="download" disabled>Download Package</button></div>
+  <h3>Detected / Preview</h3>
+  <div id="info" class="meta"></div>
+  <div id="preview" class="preview">No file loaded.</div>
+
+<script>
+// Small client-only prototype
+const fileInput = document.getElementById('file');
+const processBtn = document.getElementById('process');
+const info = document.getElementById('info');
+const preview = document.getElementById('preview');
+const downloadBtn = document.getElementById('download');
+let packageBlob = null;
+
+function guessDelimiter(sample){
+  if(sample.indexOf('\t')>=0) return '\t';
+  if((sample.match(/,/g)||[]).length > (sample.match(/;/g)||[]).length) return ',';
+  return ',';
+}
+
+function parseCSV(text){
+  const delim = guessDelimiter(text.slice(0,2000));
+  const lines = text.trim().split(/\r?\n/).filter(l=>l.trim());
+  const headers = lines[0].split(delim).map(h=>h.trim());
+  const rows = lines.slice(1).map(l=>{
+    const cols = l.split(delim).map(c=>c.trim());
+    const obj = {};
+    headers.forEach((h,i)=> obj[h]=cols[i]!==undefined?cols[i]:'');
+    return obj;
+  });
+  return {headers,rows};
+}
+
+function tryParseJSON(text){
+  try{ const j = JSON.parse(text); return j;} catch(e){return null}
+}
+
+function toISO(ts){
+  // heuristics: epoch seconds, epoch ms, or common date strings
+  if(/^[0-9]{10}$/.test(ts)) return new Date(parseInt(ts,10)*1000).toISOString();
+  if(/^[0-9]{13}$/.test(ts)) return new Date(parseInt(ts,10)).toISOString();
+  const d = new Date(ts);
+  if(!isNaN(d)) return d.toISOString();
+  return null;
+}
+
+function standardizeRows(rows){
+  // expect a timestamp-like column and numeric pose columns
+  const candidates = Object.keys(rows[0]||{});
+  // find timestamp column
+  let tcol = candidates.find(c=>/time|ts|timestamp|t\b/i.test(c)) || candidates[0];
+  const standardized = [];
+  for(const r of rows){
+    const rawt = (r[tcol]||'').toString();
+    const iso = toISO(rawt);
+    if(!iso) continue; // drop rows with unparseable timestamps
+    // collect numeric columns
+    const nums = {};
+    for(const k of candidates){
+      if(k===tcol) continue;
+      const v = parseFloat((r[k]||'').toString().replace(/[^0-9eE+-.]/g,''));
+      if(!isNaN(v)) nums[k]=v;
+    }
+    standardized.push({timestamp:iso, data:nums});
+  }
+  return standardized;
+}
+
+function buildStandardCSV(stdRows){
+  // flatten data keys
+  const allKeys = Array.from(new Set(stdRows.flatMap(r=>Object.keys(r.data))));
+  const header = ['timestamp',...allKeys];
+  const lines = [header.join(',')];
+  for(const r of stdRows){
+    const vals = [r.timestamp,...allKeys.map(k=> (k in r.data)?r.data[k]:'' )];
+    lines.push(vals.join(','));
+  }
+  return lines.join('\n');
+}
+
+processBtn.addEventListener('click', async ()=>{
+  const f = fileInput.files[0];
+  if(!f){ alert('Choose a file first.'); return; }
+  info.textContent = '';
+  preview.textContent = 'Reading...';
+  const buf = await f.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  const signature = new TextDecoder().decode(bytes.slice(0,4));
+  let parsed = null;
+  let provenance = {sourceFile: f.name, size:f.size, detected: null};
+
+  // quick ZIP check (PK..)
+  if(signature.startsWith('PK')){
+    provenance.detected = 'zip';
+    preview.textContent = 'ZIP uploaded. Attempting to read as plain text archive entries (no decompression in this prototype).\nListing first bytes of file names is not supported in this small demo.';
+    info.textContent = 'This prototype does not unpack ZIP; provide CSV or JSON directly.';
+    return;
+  }
+
+  const text = new TextDecoder().decode(bytes);
+  // try JSON
+  const j = tryParseJSON(text);
+  if(j){
+    provenance.detected = 'json';
+    // expect array of rows or object with 'data'
+    let rows = [];
+    if(Array.isArray(j)) rows = j;
+    else if(j.data && Array.isArray(j.data)) rows = j.data;
+    else if(typeof j === 'object') rows = [j];
+    if(rows.length===0){ preview.textContent='JSON parsed but no rows found.'; return; }
+    const std = standardizeRows(rows.map(r=>{
+      // stringify all values
+      const out={}; for(const k in r) out[k]=r[k]; return out; }));
+    if(std.length===0){ preview.textContent='No rows with parseable timestamps.'; return; }
+    const csv = buildStandardCSV(std);
+    const meta = {provenance, rows: std.length, columns: Object.keys(std[0].data)};
+    const packageObj = {metadata:meta, data:std};
+    packageBlob = new Blob([JSON.stringify(packageObj,null,2)],{type:'application/json'});
+    info.textContent = 'JSON detected. Rows: '+std.length;
+    preview.textContent = csv.split('\n').slice(0,10).join('\n');
+    downloadBtn.disabled = false;
+    downloadBtn.onclick = ()=>{
+      const zipName = f.name.replace(/\.[^.]*$/,'') + '_standardized.json';
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(packageBlob);
+      a.download = zipName; a.click();
+    };
+    return;
+  }
+
+  // try CSV
+  try{
+    const csvParsed = parseCSV(text);
+    provenance.detected = 'csv';
+    const std = standardizeRows(csvParsed.rows);
+    if(std.length===0){ preview.textContent='CSV parsed but no rows with parseable timestamps.'; return; }
+    const csvOut = buildStandardCSV(std);
+    const meta = {provenance, rows: std.length, columns: Object.keys(std[0].data)};
+    const packageObj = {metadata:meta, data:std};
+    const zipBlob = new Blob([csvOut],{type:'text/csv'});
+    packageBlob = new Blob([JSON.stringify(packageObj,null,2)],{type:'application/json'});
+    info.textContent = 'CSV detected. Rows: '+std.length;
+    preview.textContent = csvOut.split('\n').slice(0,12).join('\n');
+    downloadBtn.disabled = false;
+    downloadBtn.onclick = ()=>{
+      // offer both standardized CSV and JSON by triggering two downloads
+      const csvName = f.name.replace(/\.[^.]*$/,'') + '_standardized.csv';
+      const a1 = document.createElement('a');
+      a1.href = URL.createObjectURL(new Blob([csvOut],{type:'text/csv'})); a1.download = csvName; a1.click();
+      const jsonName = f.name.replace(/\.[^.]*$/,'') + '_standardized.json';
+      const a2 = document.createElement('a');
+      a2.href = URL.createObjectURL(packageBlob); a2.download = jsonName; a2.click();
+    };
+    return;
+  }catch(e){ preview.textContent='Failed to parse as CSV.'; info.textContent = e.toString(); }
+
+});
+</script>
+</body>
+</html>
